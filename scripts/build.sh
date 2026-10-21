@@ -49,16 +49,17 @@ select_java_home() {
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/build.sh [fabric|forge|all] [minecraft-version|all] [mod-version]
+  scripts/build.sh [fabric|forge|neoforge|all] [minecraft-version|all] [mod-version]
   scripts/build.sh <minecraft-version> [mod-version]
 
 Defaults: loader=all, minecraft-version=all
 
 Examples:
-  scripts/build.sh                       # both loaders, every supported version
+  scripts/build.sh                       # all supported loaders, every supported version
   scripts/build.sh fabric                # Fabric, every supported version
   scripts/build.sh forge 1.20.1          # Forge 1.20.1
-  scripts/build.sh 1.21.11               # both loaders, Minecraft 1.21.11
+  scripts/build.sh neoforge 1.21.1       # NeoForge 21.1.248
+  scripts/build.sh 1.21.11               # supported loaders, Minecraft 1.21.11
   scripts/build.sh all all 1.1.0         # release-style build of everything
 EOF
 }
@@ -69,7 +70,7 @@ mod_version=
 
 if [[ $# -gt 0 ]]; then
   case "$1" in
-    fabric|forge|all)
+    fabric|forge|neoforge|all)
       loader=$1
       shift
       if [[ $# -gt 0 ]]; then
@@ -100,6 +101,7 @@ fi
 case "$loader" in
   fabric) build_task=:fabric:build ;;
   forge) build_task=:forge:build ;;
+  neoforge) build_task=:neoforge:build ;;
   all) build_task=buildAll ;;
   *)
     echo "Unknown loader: $loader" >&2
@@ -129,6 +131,10 @@ rm -rf dist
 mkdir -p dist
 
 for version in "${minecraft_versions[@]}"; do
+  if [[ "$loader" == neoforge && "$version" != 1.21.1 ]]; then
+    echo "NeoForge is supported only for Minecraft 1.21.1" >&2
+    exit 2
+  fi
   generation=$(awk -F= '$1 == "build_generation" { print $2 }' "versions/${version}.properties")
   generation=${generation:-doggyman}
 

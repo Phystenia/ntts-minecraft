@@ -18,3 +18,11 @@ plugins {
 
 rootProject.name = 'ntts-voicechat'
 include 'common', 'fabric', 'forge'
+
+// NeoForge is currently supported only for Minecraft 1.21.1. Keep it out of
+// other version profiles so their Fabric/Forge builds remain unchanged.
+def requestedMinecraftVersion = gradle.startParameter.projectProperties
+        .getOrDefault('mcVersion', '1.20.1')
+if (requestedMinecraftVersion == '1.21.1') {
+    include 'neoforge'
+}

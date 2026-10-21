@@ -1,0 +1,123 @@
+plugins {
+    id 'net.neoforged.moddev'
+}
+
+evaluationDependsOn(':common')
+
+def profile = rootProject.versionProfile
+def mcVersion = rootProject.minecraftVersion
+def archiveName = "ntts-neoforge-${mcVersion}"
+
+if (mcVersion != '1.21.1') {
+    throw new GradleException("NeoForge is supported only for Minecraft 1.21.1, not ${mcVersion}")
+}
+
+def requiredNeoForgeProperties = [
+        'neoforge_version',
+        'neoforge_loader_requirement',
+        'neoforge_requirement',
+        'neoforge_minecraft_requirement',
+        'neoforge_voicechat_artifact',
+        'neoforge_voicechat_dependency_version',
+        'neoforge_voicechat_api_version'
+]
+requiredNeoForgeProperties.each { propertyName ->
+    if (!profile.getProperty(propertyName)) {
+        throw new GradleException("Missing '${propertyName}' in versions/${mcVersion}.properties")
+    }
+}
+
+base {
+    archivesName = archiveName
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(rootProject.javaVersion)
+}
+
+neoForge {
+    version = profile.getProperty('neoforge_version')
+
+    runs {
+        client {
+            client()
+        }
+        server {
+            server()
+            programArgument '--nogui'
+        }
+        gameTestServer {
+            type = 'gameTestServer'
+        }
+    }
+
+    mods {
+        "${rootProject.mod_id}" {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'henkelmax.public'
+        url = 'https://maven.maxhenkel.de/repository/public'
+    }
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup 'maven.modrinth'
+        }
+    }
+}
+
+configurations {
+    runtimeClasspath.extendsFrom localRuntime
+}
+
+dependencies {
+    implementation project(':common')
+    compileOnly "de.maxhenkel.voicechat:voicechat-api:${profile.getProperty('neoforge_voicechat_api_version')}"
+    localRuntime "maven.modrinth:simple-voice-chat:${profile.getProperty('neoforge_voicechat_artifact')}"
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = rootProject.javaVersion
+}
+
+processResources {
+    def replacements = [
+            mod_version                    : rootProject.modVersion,
+            minecraft_version              : mcVersion,
+            pack_format                    : profile.getProperty('pack_format'),
+            neoforge_loader_requirement    : profile.getProperty('neoforge_loader_requirement'),
+            neoforge_requirement           : profile.getProperty('neoforge_requirement'),
+            neoforge_minecraft_requirement : profile.getProperty('neoforge_minecraft_requirement'),
+            voicechat_dependency_version    : profile.getProperty('neoforge_voicechat_dependency_version')
+    ]
+    inputs.properties replacements
+    filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
+        expand replacements
+    }
+}
+
+jar {
+    from project(':common').sourceSets.main.output
+    from(rootProject.file('LICENSE')) {
+        rename { 'LICENSE_ntts' }
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes([
+                'Specification-Title'   : 'ntts',
+                'Specification-Vendor'  : 'nny',
+                'Specification-Version' : '1',
+                'Implementation-Title'  : archiveName,
+                'Implementation-Version': rootProject.modVersion,
+                'Implementation-Vendor' : 'nny'
+        ])
+    }
+}

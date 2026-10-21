@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 || $# -gt 4 ]]; then
-  echo "Usage: $0 <fabric|forge|all> <minecraft-version> [destination] [build-root]" >&2
+  echo "Usage: $0 <fabric|forge|neoforge|all> <minecraft-version> [destination] [build-root]" >&2
   exit 2
 fi
 
@@ -13,8 +13,13 @@ build_root=${4:-.}
 mkdir -p "$destination"
 
 case "$loader" in
-  fabric|forge) loaders=("$loader") ;;
-  all) loaders=(fabric forge) ;;
+  fabric|forge|neoforge) loaders=("$loader") ;;
+  all)
+    loaders=(fabric forge)
+    if [[ "$minecraft_version" == 1.21.1 && -d "$build_root/neoforge/build/libs" ]]; then
+      loaders+=(neoforge)
+    fi
+    ;;
   *)
     echo "Unknown loader: $loader" >&2
     exit 2

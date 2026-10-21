@@ -4,6 +4,7 @@ plugins {
     id 'base'
     id 'fabric-loom' version '1.10.5' apply false
     id 'net.minecraftforge.gradle' version '6.0.54' apply false
+    id 'net.neoforged.moddev' version '2.0.148' apply false
 }
 
 def requestedMinecraftVersion = providers.gradleProperty('mcVersion').getOrElse(default_minecraft_version)
@@ -54,6 +55,9 @@ allprojects {
 
 tasks.register('buildAll') {
     group = 'build'
-    description = "Builds Fabric and Forge jars for Minecraft ${minecraftVersion}."
+    description = "Builds every configured loader jar for Minecraft ${minecraftVersion}."
     dependsOn ':fabric:build', ':forge:build'
+    if (findProject(':neoforge') != null) {
+        dependsOn ':neoforge:build'
+    }
 }

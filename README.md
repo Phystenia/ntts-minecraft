@@ -4,7 +4,7 @@
 
 NTTS озвучивает сообщения игрового чата через [/N/TTS](https://ntts.fdev.team/) и воспроизводит их с помощью [Simple Voice Chat](https://modrinth.com/plugin/simple-voice-chat).
 
-Проект поддерживает Fabric и Forge. NTTS устанавливается на сервер, а Simple Voice Chat должен быть установлен на сервере и у игроков.
+Проект поддерживает Fabric, Forge и NeoForge. NTTS устанавливается на сервер, а Simple Voice Chat должен быть установлен на сервере и у игроков.
 
 ## Возможности
 
@@ -26,11 +26,11 @@ NTTS озвучивает сообщения игрового чата чере�
 - 26.1.2
 - 26.2
 
-Для каждой версии доступны отдельные сборки Fabric и Forge на странице [Releases](https://github.com/Nonne46/ntts-voicechat/releases).
+Для каждой версии доступны отдельные сборки Fabric и Forge. Для Minecraft 1.21.1 также доступна сборка NeoForge 21.1.248 на странице [Releases](https://github.com/Nonne46/ntts-voicechat/releases).
 
 ## Установка
 
-1. Установите подходящий загрузчик Fabric или Forge.
+1. Установите подходящий загрузчик Fabric, Forge или NeoForge.
 2. Установите Simple Voice Chat на сервер и клиент.
 3. Поместите соответствующий JAR-файл NTTS в серверный каталог `mods/`.
 4. Запустите сервер, чтобы создать `config/ntts.properties`.
@@ -94,6 +94,7 @@ max_text_length=300
 scripts/build.sh                 # все загрузчики и версии
 scripts/build.sh fabric          # все версии Fabric
 scripts/build.sh forge 1.20.1    # Forge для Minecraft 1.20.1
+scripts/build.sh neoforge 1.21.1 # NeoForge 21.1.248
 ```
 
 Готовые файлы появятся в каталоге `dist/`.
