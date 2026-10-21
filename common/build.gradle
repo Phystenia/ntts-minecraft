@@ -14,6 +14,13 @@ dependencies {
     compileOnly "de.maxhenkel.voicechat:voicechat-api:${rootProject.voicechatApiVersion}"
     compileOnly 'com.google.code.gson:gson:2.10.1'
     compileOnly 'org.slf4j:slf4j-api:1.7.36'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testImplementation 'org.slf4j:slf4j-api:1.7.36'
+    testRuntimeOnly 'org.slf4j:slf4j-simple:1.7.36'
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
 }
 
 java {

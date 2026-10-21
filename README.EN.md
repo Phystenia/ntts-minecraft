@@ -49,12 +49,26 @@ default_speaker=narrator_d3
 effect=
 allow_player_effects=true
 max_text_length=300
+memory_cache_enabled=true
+memory_cache_mb=16
+cache_ttl_minutes=1440
+disk_cache_enabled=false
+disk_cache_directory=config/ntts-cache
+disk_cache_mb=256
+metrics_enabled=false
+metrics_bind_address=127.0.0.1
+metrics_port=9464
 ```
 
 - `mode=local` — speech is audible near the sender.
 - `mode=global` — every player hears generated speech.
 - `voice_mode=static` — give unconfigured players the default voice.
 - `voice_mode=random` — give unconfigured players a random voice until NTTS is reloaded.
+- `memory_cache_mb` and `cache_ttl_minutes` bound the in-memory LRU cache of decoded PCM audio.
+- `disk_cache_enabled=true` enables persistent caching in `config/ntts-cache`; it is disabled by default.
+- TTS is skipped when no Simple Voice Chat listener is connected, and matching concurrent phrases share one request.
+- `metrics_enabled=true` enables `GET /metrics` for Prometheus. It is disabled by default and listens on `127.0.0.1` when enabled.
+- `metrics_port=0` selects a free ephemeral port; the selected port is written to the log and `/ntts status`. Set `metrics_bind_address` to an external address only intentionally.
 
 A voice chosen with `/set_speaker` always takes priority over the initial assignment.
 
@@ -85,6 +99,29 @@ Main operator commands:
 ```
 
 Run `/ntts help` for the complete command syntax.
+
+## Prometheus/Grafana
+
+Add this target to `prometheus.yml` on the Minecraft host:
+
+```yaml
+scrape_configs:
+  - job_name: ntts
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+```
+
+Basic Grafana panels can use these PromQL expressions:
+
+```text
+ntts_request_duration_seconds_bucket
+ntts_queue_wait_duration_seconds_bucket
+rate(ntts_requests_total{result="completed"}[5m])
+rate(ntts_requests_total{result=~"failed|dropped|rejected"}[5m])
+ntts_rate_limit_events_total
+ntts_quota_exhausted
+ntts_tts_available
+```
 
 ## Building
 

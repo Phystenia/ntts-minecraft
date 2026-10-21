@@ -1,6 +1,6 @@
 # Спецификация NTTS VoiceChat
 
-Статус: draft  
+Статус: implemented
 Целевая платформа: Minecraft 1.21.1 / NeoForge 21.1.248  
 Java: 21  
 Mod ID: `ntts`
@@ -115,6 +115,12 @@ config/ntts.properties
 
 ```properties
 enabled=true
+memory_cache_enabled=true
+memory_cache_mb=16
+cache_ttl_minutes=1440
+disk_cache_enabled=false
+disk_cache_directory=config/ntts-cache
+disk_cache_mb=256
 mode=local
 voice_mode=random
 default_speaker=narrator_d3
@@ -176,6 +182,152 @@ config/ntts_player_admin.json
 - HTTP 429 переводит клиент в состояние `RATE_LIMITED`.
 - HTTP 5xx и сетевые ошибки переводят клиент в состояние `UNAVAILABLE` с backoff.
 - При остановке сервера очередь очищается, а worker завершается.
+
+## 4.1. Кеширование и дедупликация
+
+Мод обязан использовать два независимых уровня кеширования.
+
+### Memory-cache
+
+В памяти хранится LRU-кеш PCM-аудио. Ключ строится из нормализованного текста,
+голоса, эффекта, формата и sample rate. Токен не входит в ключ и не должен
+попадать в имя или содержимое кеш-файла.
+
+Кеш потокобезопасен, ограничен по размеру и TTL. Просроченные записи не выдаются,
+а ошибки кеша не должны останавливать сервер.
+
+### Disk-cache
+
+Постоянный кеш выключен по умолчанию. Файлы именуются SHA-256 ключа синтеза;
+исходный текст и токен не должны сохраняться в имени файла, логах или диагностике.
+Запись выполняется через временный файл и atomic move. Формат, размер, TTL и
+целостность проверяются при чтении. Повреждённые записи игнорируются без падения.
+
+### In-flight дедупликация
+
+Если одинаковый синтез уже выполняется, новый HTTP-запрос не создаётся. Новый
+получатель присоединяется к pending request и получает тот же результат после
+завершения генерации. Запрещено блокировать единственный synthesis worker через
+`Future.get()` или эквивалентное ожидание. Pending-запись всегда удаляется после
+успеха или ошибки.
+
+## 4.2. Проверка слушателей
+
+До постановки синтеза в очередь мод обязан проверить получателей:
+
+- в `local` — активное voice-chat соединение говорящего;
+- в `global` — хотя бы одно активное соединение среди целевых игроков.
+
+Если слушателей нет, HTTP-запрос к TTS API не выполняется, а счётчик
+`skippedNoListeners` увеличивается. Перед воспроизведением соединение проверяется
+повторно, потому что игрок мог выйти во время синтеза.
+
+## 4.3. Наблюдаемость
+
+`/ntts status` должен показывать без секретов:
+
+- HTTP requests;
+- memory-cache hits/misses/evictions;
+- disk-cache hits/misses;
+- in-flight deduplicated requests;
+- skipped-no-listeners;
+- completed/failed/dropped/rejected requests;
+- среднюю задержку синтеза;
+- размер очереди и число активных задач.
+
+## 4.4. HTTP metrics endpoint для Prometheus/Grafana
+
+Мод должен предоставлять опциональный HTTP endpoint формата Prometheus для сбора
+метрик Grafana/Prometheus. Endpoint запускается в отдельном daemon-потоке и никогда
+не выполняет блокирующие операции на основном потоке Minecraft или synthesis worker.
+
+### Конфигурация
+
+В `config/ntts.properties` добавить:
+
+```properties
+metrics_enabled=false
+metrics_bind_address=127.0.0.1
+metrics_port=9464
+```
+
+`metrics_port=0` означает автоматический выбор свободного порта; фактически выбранный
+порт должен быть записан в лог. Порт должен быть в диапазоне `1024..65535`, если не
+используется `0`. Значение `metrics_bind_address` по умолчанию `127.0.0.1`; bind на
+внешний интерфейс разрешается только явной настройкой.
+
+Endpoint: `GET /metrics`. Для неизвестного пути возвращать `404`, для другого метода
+`405`. Ответ должен иметь `Content-Type: text/plain; version=0.0.4` и корректный
+Prometheus text exposition format. При остановке или ошибке запуска HTTP-сервера мод
+не должен падать: ошибка фиксируется в логах и `/ntts status`.
+
+### Обязательные метрики
+
+Имена и типы должны оставаться стабильными:
+
+```text
+ntts_up gauge
+ntts_tts_available gauge
+ntts_queue_waiting gauge
+ntts_queue_active gauge
+ntts_queue_capacity gauge
+ntts_requests_total counter{result="accepted|completed|failed|dropped|rejected"}
+ntts_http_requests_total counter{result="success|failure",status_class="2xx|4xx|5xx|network|timeout"}
+ntts_request_duration_seconds histogram
+ntts_queue_wait_duration_seconds histogram
+ntts_cache_requests_total counter{cache="memory|disk",result="hit|miss"}
+ntts_cache_evictions_total counter{cache="memory"}
+ntts_inflight_deduplicated_total counter
+ntts_skipped_no_listeners_total counter
+ntts_rate_limit_events_total counter{source="http|provider"}
+ntts_quota_exhausted gauge
+ntts_quota_characters_used gauge
+ntts_quota_characters_limit gauge
+ntts_last_success_timestamp_seconds gauge
+ntts_last_failure_timestamp_seconds gauge
+ntts_uptime_seconds gauge
+```
+
+Для HTTP и request duration использовать buckets, достаточные для различения быстрых
+кешированных ответов и медленного TTS, например `0.05, 0.1, 0.25, 0.5, 1, 2.5,
+5, 10, 30, 60, +Inf`. Не включать в labels голос, эффект, текст, UUID игрока, token,
+URL запроса или произвольное сообщение: cardinality должна быть ограничена.
+
+### Состояния и лимиты
+
+`ntts_up=1` означает, что metrics endpoint запущен и способен ответить. Отдельно
+`ntts_tts_available=1` означает готовность TTS-клиента; `0` — `INVALID`,
+`RATE_LIMITED`, `QUOTA_EXHAUSTED`, `UNAVAILABLE` или отсутствие credentials.
+`ntts_quota_characters_used` и `ntts_quota_characters_limit` не должны раскрывать
+token. Если провайдер не отдаёт значение, публиковать `0` и состояние доступности,
+а не выдуманное число.
+
+Счётчики должны отражать причины упора в ограничения: HTTP 429, исчерпание квоты,
+переполнение bounded queue и отклонённые задачи. Время последнего успеха/ошибки
+публиковать в Unix seconds; до первого события значение `0`.
+
+### Lifecycle и эксплуатация
+
+- запускать endpoint после загрузки конфигурации;
+- при `/ntts reload` безопасно применять изменения bind address/port, не оставляя
+  старый listener;
+- при остановке сервера закрывать listener и executor;
+- не создавать новый HTTP server на каждый scrape;
+- scrape должен быть быстрым и не обращаться к TTS API;
+- добавить README-пример подключения Prometheus и базовые Grafana-панели: latency,
+  queue, success/error rate, rate limit/quota, TTS availability.
+
+### Критерии приёмки metrics endpoint
+
+- при `metrics_enabled=true` `GET /metrics` возвращает валидный exposition format;
+- порт и bind address читаются из `ntts.properties`, значения валидируются;
+- endpoint не блокирует Minecraft, TTS worker и не выполняет сетевых TTS-запросов;
+- все обязательные метрики присутствуют и обновляются после synthetic/cache/error
+  сценариев;
+- секреты, тексты и player identifiers отсутствуют в ответе;
+- занятый порт обрабатывается без падения мода;
+- lifecycle и reload не оставляют потоки/listeners;
+- добавлены unit-тесты и NeoForge/Fabric/Forge сборки проходят.
 
 ## 5. Аудиопоток
 
@@ -256,6 +408,11 @@ java_version=21
 - команды оператора защищены правами;
 - данные и конфигурация сохраняются после перезапуска;
 - ошибки TTS не останавливают Minecraft-сервер;
+- одинаковые параллельные фразы выполняют только один HTTP-запрос;
+- при отсутствии voice-chat слушателей HTTP-запрос не выполняется;
+- TTL и лимит memory-cache соблюдаются;
+- опциональный disk-cache переживает перезапуск и не содержит секретов;
+- `/ntts status` показывает метрики кеша и дедупликации;
 - текущие Fabric и Forge-сборки продолжают собираться.
 
 ## 10. План реализации
@@ -268,5 +425,10 @@ java_version=21
 6. Проверить регистрацию Voice Chat plugin и воспроизведение PCM.
 7. Добавить smoke-тесты сервера и команд.
 8. Проверить конфигурацию, очередь, ошибки, rate limit и остановку сервера.
-9. Обновить CI, README и список поддерживаемых сборок.
+9. Добавить listener pre-check, in-flight дедупликацию и memory-cache TTL.
+10. Добавить опциональный disk-cache с атомарной записью и ограничением размера.
+11. Добавить метрики кеша, пропусков и дедупликации в `/ntts status`.
+12. Написать unit-тесты для ключей, TTL, LRU, deduplication и повреждённых записей.
+13. Проверить NeoForge server smoke-test и регрессию Fabric/Forge.
+14. Обновить CI, README и список поддерживаемых сборок.
 

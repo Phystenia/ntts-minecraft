@@ -9,6 +9,7 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URLEncoder;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
@@ -28,6 +29,7 @@ public final class NttsClient {
 
     private final String token;
     private final Logger logger;
+    private final HttpRequestObserver httpRequestObserver;
 
     private final Object pacingLock = new Object();
 
@@ -38,8 +40,15 @@ public final class NttsClient {
     private long nextRequestAt;
 
     public NttsClient(String token, Logger logger) {
+        this(token, logger, (statusClass, success, rateLimited) -> { });
+    }
+
+    public NttsClient(String token, Logger logger, HttpRequestObserver httpRequestObserver) {
         this.token = token == null ? "" : token.trim();
         this.logger = logger;
+        this.httpRequestObserver = httpRequestObserver == null
+                ? (statusClass, success, rateLimited) -> { }
+                : httpRequestObserver;
         state = isConfiguredToken(this.token) ? ProviderState.READY : ProviderState.UNCONFIGURED;
     }
 
@@ -78,6 +87,7 @@ public final class NttsClient {
                 connection.setReadTimeout(60_000);
 
                 int status = connection.getResponseCode();
+                notifyHttpRequest(statusClass(status), status >= 200 && status < 300, status == 429);
                 if (status >= 200 && status < 300) {
                     byte[] data = connection.getInputStream().readAllBytes();
                     locallyUsedCharacters += characterCount;
@@ -108,7 +118,18 @@ public final class NttsClient {
                 blockedUntil = System.currentTimeMillis() + UNAVAILABLE_BACKOFF_MILLIS;
                 logger.warn("/N/TTS request failed with HTTP {}", status);
                 return SynthesisResult.failure(state);
+            } catch (SocketTimeoutException exception) {
+                notifyHttpRequest("timeout", false, false);
+                if (attempt < MAX_ATTEMPTS) {
+                    sleepBeforeRetry(attempt);
+                    continue;
+                }
+                state = ProviderState.UNAVAILABLE;
+                blockedUntil = System.currentTimeMillis() + UNAVAILABLE_BACKOFF_MILLIS;
+                logger.warn("/N/TTS request timed out");
+                return SynthesisResult.failure(state);
             } catch (Exception exception) {
+                notifyHttpRequest("network", false, false);
                 if (attempt < MAX_ATTEMPTS) {
                     sleepBeforeRetry(attempt);
                     continue;
@@ -143,6 +164,7 @@ public final class NttsClient {
             connection.setReadTimeout(30_000);
 
             int status = connection.getResponseCode();
+            notifyHttpRequest(statusClass(status), status >= 200 && status < 300, status == 429);
             if (status == HttpURLConnection.HTTP_UNAUTHORIZED
                     || status == HttpURLConnection.HTTP_FORBIDDEN
                     || status == HttpURLConnection.HTTP_NOT_FOUND) {
@@ -180,7 +202,12 @@ public final class NttsClient {
                 blockedUntil = 0L;
                 return true;
             }
+        } catch (SocketTimeoutException exception) {
+            notifyHttpRequest("timeout", false, false);
+            logger.warn("Failed to load /N/TTS token metadata: request timed out");
+            return false;
         } catch (Exception exception) {
+            notifyHttpRequest("network", false, false);
             logger.warn("Failed to load /N/TTS token metadata: {}", exception.toString());
             return false;
         } finally {
@@ -203,7 +230,9 @@ public final class NttsClient {
             connection.setConnectTimeout(10_000);
             connection.setReadTimeout(30_000);
 
-            if (connection.getResponseCode() == HttpURLConnection.HTTP_OK) {
+            int status = connection.getResponseCode();
+            notifyHttpRequest(statusClass(status), status >= 200 && status < 300, status == 429);
+            if (status == HttpURLConnection.HTTP_OK) {
                 try (BufferedReader reader = new BufferedReader(
                         new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {
                     VoiceResponse response = new Gson().fromJson(reader, VoiceResponse.class);
@@ -212,7 +241,11 @@ public final class NttsClient {
                             : response.voices;
                 }
             }
+        } catch (SocketTimeoutException exception) {
+            notifyHttpRequest("timeout", false, false);
+            logger.warn("Failed to load /N/TTS speakers: request timed out");
         } catch (Exception exception) {
+            notifyHttpRequest("network", false, false);
             logger.warn("Failed to load /N/TTS speakers: {}", exception.toString());
         } finally {
             if (connection != null) {
@@ -231,7 +264,9 @@ public final class NttsClient {
             connection.setConnectTimeout(10_000);
             connection.setReadTimeout(30_000);
 
-            if (connection.getResponseCode() == HttpURLConnection.HTTP_OK) {
+            int status = connection.getResponseCode();
+            notifyHttpRequest(statusClass(status), status >= 200 && status < 300, status == 429);
+            if (status == HttpURLConnection.HTTP_OK) {
                 try (BufferedReader reader = new BufferedReader(
                         new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {
                     EffectResponse response = new Gson().fromJson(reader, EffectResponse.class);
@@ -240,7 +275,11 @@ public final class NttsClient {
                             : response.effects;
                 }
             }
+        } catch (SocketTimeoutException exception) {
+            notifyHttpRequest("timeout", false, false);
+            logger.warn("Failed to load /N/TTS effects: request timed out");
         } catch (Exception exception) {
+            notifyHttpRequest("network", false, false);
             logger.warn("Failed to load /N/TTS effects: {}", exception.toString());
         } finally {
             if (connection != null) {
@@ -267,6 +306,18 @@ public final class NttsClient {
 
     public String getSafeLimitSummary() {
         return tokenLimits.safeSummary(locallyUsedCharacters);
+    }
+
+    public long getQuotaCharactersUsed() {
+        return Math.max(0L, locallyUsedCharacters);
+    }
+
+    public long getQuotaCharactersLimit() {
+        return Math.max(0L, tokenLimits.characterQuota);
+    }
+
+    public boolean isQuotaExhausted() {
+        return tokenLimits.isQuotaExhausted(locallyUsedCharacters);
     }
 
     public static String normalizeText(String text, int maximumCodePoints) {
@@ -324,6 +375,27 @@ public final class NttsClient {
         }
     }
 
+    private void notifyHttpRequest(String statusClass, boolean success, boolean rateLimited) {
+        try {
+            httpRequestObserver.onRequest(statusClass, success, rateLimited);
+        } catch (RuntimeException ignored) {
+            // Observability must never affect TTS requests.
+        }
+    }
+
+    private static String statusClass(int status) {
+        if (status >= 200 && status < 300) {
+            return "2xx";
+        }
+        if (status >= 400 && status < 500) {
+            return "4xx";
+        }
+        if (status >= 500 && status < 600) {
+            return "5xx";
+        }
+        return "network";
+    }
+
     private static boolean isConfiguredToken(String value) {
         return !value.isBlank() && !"your_token_here".equalsIgnoreCase(value);
     }
@@ -364,6 +436,11 @@ public final class NttsClient {
         public String displayName() {
             return name().toLowerCase(Locale.ROOT).replace('_', '-');
         }
+    }
+
+    @FunctionalInterface
+    public interface HttpRequestObserver {
+        void onRequest(String statusClass, boolean success, boolean rateLimited);
     }
 
     public static final class SynthesisResult {

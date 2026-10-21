@@ -27,12 +27,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -43,6 +45,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -57,6 +61,14 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
     private static final int DEFAULT_MAXIMUM_TEXT_LENGTH = 300;
     private static final int MAXIMUM_CONFIGURED_TEXT_LENGTH = 2_000;
     private static final int QUEUE_CAPACITY = 32;
+    private static final int DEFAULT_MEMORY_CACHE_MEGABYTES = 16;
+    private static final int DEFAULT_CACHE_TTL_MINUTES = 1_440;
+    private static final int DEFAULT_DISK_CACHE_MEGABYTES = 256;
+    private static final int MAXIMUM_CACHE_MEGABYTES = 1_024;
+    private static final int MAXIMUM_CACHE_TTL_MINUTES = 43_200;
+    private static final List<String> HTTP_STATUS_CLASSES = List.of(
+            "2xx", "4xx", "5xx", "network", "timeout"
+    );
     private static final int NO_FUZZY_MATCH = Integer.MAX_VALUE;
     private static final int SEARCH_TERM_PENALTY = 5;
     private static final List<String> CONFIGURATION_KEYS = List.of(
@@ -66,10 +78,19 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
             "default_speaker",
             "effect",
             "allow_player_effects",
-            "max_text_length"
+            "max_text_length",
+            "memory_cache_enabled",
+            "memory_cache_mb",
+            "cache_ttl_minutes",
+            "disk_cache_enabled",
+            "disk_cache_directory",
+            "disk_cache_mb",
+            "metrics_enabled",
+            "metrics_bind_address",
+            "metrics_port"
     );
-    private static final long AUDIO_CACHE_MAXIMUM_BYTES = 16L * 1024L * 1024L;
     private static final Path CONFIG_FILE = Path.of("config", "ntts.properties");
+    private static final Path DEFAULT_DISK_CACHE_DIRECTORY = Path.of("config", "ntts-cache");
     private static final Path SPEAKER_DATA_FILE = Path.of("config", "ntts_speaker_data.json");
     private static final Path EFFECT_DATA_FILE = Path.of("config", "ntts_effect_data.json");
     private static final Path PLAYER_ADMIN_DATA_FILE = Path.of("config", "ntts_player_admin.json");
@@ -81,7 +102,19 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
     private final Map<UUID, String> adminSpeakerData = new HashMap<>();
     private final Set<UUID> speakerLocks = new HashSet<>();
     private final Map<UUID, String> randomSpeakerData = new HashMap<>();
-    private final AudioCache audioCache = new AudioCache(AUDIO_CACHE_MAXIMUM_BYTES);
+    private final ConcurrentMap<String, PendingSynthesis> inFlightSyntheses = new ConcurrentHashMap<>();
+    private volatile AudioCache audioCache = new AudioCache(
+            true,
+            megabytesToBytes(DEFAULT_MEMORY_CACHE_MEGABYTES),
+            minutesToMillis(DEFAULT_CACHE_TTL_MINUTES)
+    );
+    private volatile DiskAudioCache diskAudioCache = new DiskAudioCache(
+            false,
+            DEFAULT_DISK_CACHE_DIRECTORY,
+            megabytesToBytes(DEFAULT_DISK_CACHE_MEGABYTES),
+            minutesToMillis(DEFAULT_CACHE_TTL_MINUTES),
+            logger
+    );
     private final ThreadPoolExecutor synthesisExecutor = new ThreadPoolExecutor(
             1,
             1,
@@ -101,8 +134,24 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
     private final AtomicLong droppedRequests = new AtomicLong();
     private final AtomicLong rejectedRequests = new AtomicLong();
     private final AtomicLong cacheHits = new AtomicLong();
+    private final AtomicLong cacheMisses = new AtomicLong();
+    private final AtomicLong cacheEvictions = new AtomicLong();
+    private final AtomicLong diskCacheHits = new AtomicLong();
+    private final AtomicLong diskCacheMisses = new AtomicLong();
+    private final AtomicLong deduplicatedRequests = new AtomicLong();
+    private final AtomicLong skippedNoListeners = new AtomicLong();
+    private final AtomicLong httpRequests = new AtomicLong();
     private final AtomicLong timedRequests = new AtomicLong();
     private final AtomicLong totalLatencyMillis = new AtomicLong();
+    private final Map<String, AtomicLong> successfulHttpRequests = createHttpCounters();
+    private final Map<String, AtomicLong> failedHttpRequests = createHttpCounters();
+    private final PrometheusHistogram requestDuration = new PrometheusHistogram();
+    private final PrometheusHistogram queueWaitDuration = new PrometheusHistogram();
+    private final AtomicLong rateLimitHttpEvents = new AtomicLong();
+    private final AtomicLong rateLimitProviderEvents = new AtomicLong();
+    private final AtomicLong lastSuccessTimestampSeconds = new AtomicLong();
+    private final AtomicLong lastFailureTimestampSeconds = new AtomicLong();
+    private final long metricsStartedAtNanos = System.nanoTime();
 
     private volatile List<String> speakers = Collections.emptyList();
     private volatile List<SuggestionEntry> speakerSuggestionEntries = Collections.emptyList();
@@ -110,16 +159,29 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
     private volatile List<String> effects = Collections.emptyList();
     private volatile VoicechatApi voicechatApi;
     private volatile VoicechatServerApi voicechatServerApi;
-    private volatile NttsClient nttsClient = new NttsClient("", logger);
+    private volatile NttsClient nttsClient = new NttsClient("", logger, this::recordHttpRequest);
     private volatile String ttsMode = "local";
     private volatile String voiceMode = "random";
     private volatile String defaultSpeaker = DEFAULT_SPEAKER;
     private volatile String defaultEffect = "";
     private volatile String lastFailure = "none";
     private volatile int maximumTextLength = DEFAULT_MAXIMUM_TEXT_LENGTH;
+    private volatile boolean memoryCacheEnabled = true;
+    private volatile int memoryCacheMegabytes = DEFAULT_MEMORY_CACHE_MEGABYTES;
+    private volatile int cacheTtlMinutes = DEFAULT_CACHE_TTL_MINUTES;
+    private volatile boolean diskCacheEnabled;
+    private volatile Path diskCacheDirectory = DEFAULT_DISK_CACHE_DIRECTORY;
+    private volatile int diskCacheMegabytes = DEFAULT_DISK_CACHE_MEGABYTES;
     private volatile boolean runtimeEnabled;
     private volatile boolean playerEffectsEnabled = true;
     private volatile boolean serverReady;
+    private volatile boolean metricsEnabled;
+    private volatile String metricsBindAddress = MetricsConfiguration.DEFAULT_BIND_ADDRESS;
+    private volatile int metricsPort = MetricsConfiguration.DEFAULT_PORT;
+    private final PrometheusMetricsServer metricsServer = new PrometheusMetricsServer(
+            logger,
+            this::renderPrometheusMetrics
+    );
 
     @Override
     public final String getPluginId() {
@@ -161,7 +223,8 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
     ) {
         VoicechatApi currentApi = voicechatApi;
         NttsClient currentClient = nttsClient;
-        if (!runtimeEnabled || !serverReady || currentApi == null) {
+        VoicechatServerApi currentServerApi = voicechatServerApi;
+        if (!runtimeEnabled || !serverReady || currentApi == null || currentServerApi == null) {
             return false;
         }
         NttsClient.ProviderState providerState = currentClient.getState();
@@ -169,6 +232,8 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
             if (providerState == NttsClient.ProviderState.RATE_LIMITED
                     || providerState == NttsClient.ProviderState.QUOTA_EXHAUSTED) {
                 droppedRequests.incrementAndGet();
+                rateLimitProviderEvents.incrementAndGet();
+                recordFailureTimestamp();
             }
             return false;
         }
@@ -184,31 +249,37 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
             return false;
         }
 
+        String capturedMode = ttsMode;
         List<ServerPlayer> globalTargets = Collections.emptyList();
-        if ("global".equals(ttsMode) && nativeOnlinePlayers != null) {
+        if ("global".equals(capturedMode) && nativeOnlinePlayers != null) {
             globalTargets = new ArrayList<>();
             for (Object nativeTarget : nativeOnlinePlayers) {
                 ServerPlayer target = currentApi.fromServerPlayer(nativeTarget);
-                if (target != null) {
+                if (target != null && currentServerApi.getConnectionOf(target) != null) {
                     globalTargets.add(target);
                 }
             }
+        }
+        if ("global".equals(capturedMode) ? globalTargets.isEmpty()
+                : currentServerApi.getConnectionOf(speakerPlayer) == null) {
+            skippedNoListeners.incrementAndGet();
+            return false;
         }
 
         UUID playerId = speakerPlayer.getUuid();
         String speaker = selectSpeaker(playerId);
         String effect = selectEffect(playerId);
-        List<ServerPlayer> capturedTargets = globalTargets;
-        String capturedMode = ttsMode;
-        return submitSynthesis(() -> synthesizeAndPlay(
+        PlaybackRequest request = new PlaybackRequest(speakerPlayer, globalTargets, capturedMode);
+        String cacheKey = synthesisKey(normalizedText, speaker, effect);
+        return enqueueSynthesis(
+                cacheKey,
                 currentClient,
                 normalizedText,
                 speaker,
                 effect,
-                speakerPlayer,
-                capturedTargets,
-                capturedMode
-        ));
+                request,
+                System.nanoTime()
+        );
     }
 
     protected final List<String> getSpeakerSuggestions(String query) {
@@ -244,6 +315,9 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
         switch (normalizeConfigurationKey(key)) {
             case "enabled":
             case "allow_player_effects":
+            case "memory_cache_enabled":
+            case "disk_cache_enabled":
+            case "metrics_enabled":
                 entries.add(SuggestionEntry.fromValue("true"));
                 entries.add(SuggestionEntry.fromValue("false"));
                 break;
@@ -263,6 +337,30 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
                 entries.add(SuggestionEntry.fromValue("100"));
                 entries.add(SuggestionEntry.fromValue("300"));
                 entries.add(SuggestionEntry.fromValue("500"));
+                break;
+            case "memory_cache_mb":
+                entries.add(SuggestionEntry.fromValue("16"));
+                entries.add(SuggestionEntry.fromValue("64"));
+                entries.add(SuggestionEntry.fromValue("256"));
+                break;
+            case "cache_ttl_minutes":
+                entries.add(SuggestionEntry.fromValue("60"));
+                entries.add(SuggestionEntry.fromValue("1440"));
+                break;
+            case "disk_cache_mb":
+                entries.add(SuggestionEntry.fromValue("256"));
+                entries.add(SuggestionEntry.fromValue("512"));
+                break;
+            case "disk_cache_directory":
+                entries.add(SuggestionEntry.fromValue("config/ntts-cache"));
+                break;
+            case "metrics_bind_address":
+                entries.add(SuggestionEntry.fromValue(MetricsConfiguration.DEFAULT_BIND_ADDRESS));
+                entries.add(SuggestionEntry.fromValue("0.0.0.0"));
+                break;
+            case "metrics_port":
+                entries.add(SuggestionEntry.fromValue(Integer.toString(MetricsConfiguration.DEFAULT_PORT)));
+                entries.add(SuggestionEntry.fromValue("0"));
                 break;
             default:
                 return Collections.emptyList();
@@ -507,10 +605,20 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
                 + failedRequests.get() + " failed, "
                 + droppedRequests.get() + " dropped, "
                 + rejectedRequests.get() + " rejected");
+        lines.add("HTTP: " + httpRequests.get() + " requests | In-flight: "
+                + inFlightSyntheses.size() + " active, " + deduplicatedRequests.get() + " deduplicated");
+        lines.add("Memory cache: " + cacheHits.get() + " hits, " + cacheMisses.get()
+                + " misses, " + cacheEvictions.get() + " evictions (" + memoryCacheMegabytes + " MB, TTL "
+                + cacheTtlMinutes + " min)");
+        lines.add("Disk cache: " + (diskCacheEnabled ? "enabled" : "disabled") + ", "
+                + diskCacheHits.get() + " hits, " + diskCacheMisses.get() + " misses, "
+                + diskCacheMegabytes + " MB");
+        lines.add("Skipped: " + skippedNoListeners.get() + " without voice-chat listeners");
         if (timed > 0L) {
-            lines.add("Performance: " + averageLatency + " ms average, " + cacheHits.get() + " cache hits");
+            lines.add("Performance: " + averageLatency + " ms average synthesis latency");
         }
         lines.add("Limits: " + nttsClient.getSafeLimitSummary());
+        lines.add("Metrics: " + (metricsEnabled ? metricsServer.getStatus() : "disabled"));
         if (!"none".equals(lastFailure)) {
             lines.add("Last issue: " + titleCase(lastFailure));
         }
@@ -582,8 +690,12 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
     }
 
     protected final int clearPendingRequests() {
-        int removed = synthesisExecutor.getQueue().size();
+        int removed = synthesisExecutor.getQueue().size() + inFlightSyntheses.size();
         synthesisExecutor.getQueue().clear();
+        for (PendingSynthesis pending : inFlightSyntheses.values()) {
+            pending.complete();
+        }
+        inFlightSyntheses.clear();
         return removed;
     }
 
@@ -617,12 +729,39 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
                 throw new IllegalArgumentException(
                         "max_text_length must be between 1 and " + MAXIMUM_CONFIGURED_TEXT_LENGTH);
             }
+            boolean configuredMemoryCacheEnabled = parseBooleanProperty(config, "memory_cache_enabled", true);
+            int configuredMemoryCacheMegabytes = parseBoundedIntegerProperty(
+                    config,
+                    "memory_cache_mb",
+                    DEFAULT_MEMORY_CACHE_MEGABYTES,
+                    1,
+                    MAXIMUM_CACHE_MEGABYTES
+            );
+            int configuredCacheTtlMinutes = parseBoundedIntegerProperty(
+                    config,
+                    "cache_ttl_minutes",
+                    DEFAULT_CACHE_TTL_MINUTES,
+                    1,
+                    MAXIMUM_CACHE_TTL_MINUTES
+            );
+            boolean configuredDiskCacheEnabled = parseBooleanProperty(config, "disk_cache_enabled", false);
+            Path configuredDiskCacheDirectory = parseDiskCacheDirectory(
+                    config.getProperty("disk_cache_directory", "config/ntts-cache")
+            );
+            int configuredDiskCacheMegabytes = parseBoundedIntegerProperty(
+                    config,
+                    "disk_cache_mb",
+                    DEFAULT_DISK_CACHE_MEGABYTES,
+                    1,
+                    MAXIMUM_CACHE_MEGABYTES
+            );
+            MetricsConfiguration configuredMetrics = MetricsConfiguration.from(config);
 
             String environmentToken = System.getenv(TOKEN_ENVIRONMENT_VARIABLE);
             String token = environmentToken == null || environmentToken.isBlank()
                     ? config.getProperty("token", "")
                     : environmentToken;
-            NttsClient replacementClient = new NttsClient(token, logger);
+            NttsClient replacementClient = new NttsClient(token, logger, this::recordHttpRequest);
 
             ttsMode = configuredMode;
             voiceMode = configuredVoiceMode;
@@ -631,13 +770,34 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
             playerEffectsEnabled = configuredPlayerEffects;
             randomSpeakerData.clear();
             maximumTextLength = configuredMaximum;
+            memoryCacheEnabled = configuredMemoryCacheEnabled;
+            memoryCacheMegabytes = configuredMemoryCacheMegabytes;
+            cacheTtlMinutes = configuredCacheTtlMinutes;
+            diskCacheEnabled = configuredDiskCacheEnabled;
+            diskCacheDirectory = configuredDiskCacheDirectory;
+            diskCacheMegabytes = configuredDiskCacheMegabytes;
+            metricsEnabled = configuredMetrics.isEnabled();
+            metricsBindAddress = configuredMetrics.getBindAddress();
+            metricsPort = configuredMetrics.getPort();
+            audioCache = new AudioCache(
+                    configuredMemoryCacheEnabled,
+                    megabytesToBytes(configuredMemoryCacheMegabytes),
+                    minutesToMillis(configuredCacheTtlMinutes)
+            );
+            diskAudioCache = new DiskAudioCache(
+                    configuredDiskCacheEnabled,
+                    configuredDiskCacheDirectory,
+                    megabytesToBytes(configuredDiskCacheMegabytes),
+                    minutesToMillis(configuredCacheTtlMinutes),
+                    logger
+            );
             nttsClient = replacementClient;
+            metricsServer.apply(configuredMetrics);
             runtimeEnabled = configuredEnabled
                     && replacementClient.getState() != NttsClient.ProviderState.UNCONFIGURED;
             lastFailure = replacementClient.getState() == NttsClient.ProviderState.UNCONFIGURED
                     ? "credential-unconfigured"
                     : "none";
-            audioCache.clear();
             speakers = Collections.emptyList();
             speakerSuggestionEntries = Collections.emptyList();
             speakerSuggestionLabels = Collections.emptyMap();
@@ -649,12 +809,15 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
                 });
             }
             logger.info(
-                    "Loaded /N/TTS configuration: enabled={}, mode={}, voiceMode={}, playerEffects={}, maxTextLength={}, credentialSource={}",
+                    "Loaded /N/TTS configuration: enabled={}, mode={}, voiceMode={}, playerEffects={}, maxTextLength={}, memoryCache={}MB, diskCache={}, metrics={}, credentialSource={}",
                     runtimeEnabled,
                     ttsMode,
                     voiceMode,
                     playerEffectsEnabled,
                     maximumTextLength,
+                    memoryCacheMegabytes,
+                    diskCacheEnabled,
+                    metricsEnabled ? metricsBindAddress + ":" + metricsPort : "disabled",
                     environmentToken == null || environmentToken.isBlank() ? "config" : "environment"
             );
             return true;
@@ -782,65 +945,137 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
     protected final void stopServer() {
         serverReady = false;
         voicechatServerApi = null;
+        metricsServer.close();
         clearPendingRequests();
         saveSpeakerData();
     }
 
-    private void synthesizeAndPlay(
+    private boolean enqueueSynthesis(
+            String cacheKey,
             NttsClient client,
             String text,
             String speaker,
             String effect,
-            ServerPlayer speakerPlayer,
-            List<ServerPlayer> globalTargets,
-            String mode
+            PlaybackRequest request,
+            long queuedAtNanos
+    ) {
+        while (true) {
+            PendingSynthesis pending = new PendingSynthesis(request);
+            PendingSynthesis existing = inFlightSyntheses.putIfAbsent(cacheKey, pending);
+            if (existing == null) {
+                if (submitSynthesis(() -> synthesizePending(
+                        cacheKey,
+                        client,
+                        text,
+                        speaker,
+                        effect,
+                        pending,
+                        queuedAtNanos
+                ))) {
+                    return true;
+                }
+                inFlightSyntheses.remove(cacheKey, pending);
+                return false;
+            }
+            if (existing.add(request)) {
+                acceptedRequests.incrementAndGet();
+                deduplicatedRequests.incrementAndGet();
+                return true;
+            }
+            inFlightSyntheses.remove(cacheKey, existing);
+        }
+    }
+
+    private void synthesizePending(
+            String cacheKey,
+            NttsClient client,
+            String text,
+            String speaker,
+            String effect,
+            PendingSynthesis pending,
+            long queuedAtNanos
     ) {
         long startedAt = System.nanoTime();
-        String cacheKey = speaker + '\u0000' + effect + '\u0000' + text;
+        queueWaitDuration.observe(TimeUnit.NANOSECONDS.toMillis(startedAt - queuedAtNanos) / 1_000D);
+        short[] samples = null;
         try {
-            short[] samples = audioCache.get(cacheKey);
+            samples = audioCache.get(cacheKey);
             if (samples != null) {
                 cacheHits.incrementAndGet();
             } else {
-                NttsClient.SynthesisResult result = client.generateTts(text, speaker, effect);
-                if (!result.isSuccess()) {
-                    if (result.getState() == NttsClient.ProviderState.RATE_LIMITED
-                            || result.getState() == NttsClient.ProviderState.QUOTA_EXHAUSTED) {
-                        droppedRequests.incrementAndGet();
-                    } else {
-                        failedRequests.incrementAndGet();
-                        lastFailure = result.getState().displayName();
+                cacheMisses.incrementAndGet();
+                samples = diskAudioCache.get(cacheKey);
+                if (samples != null) {
+                    diskCacheHits.incrementAndGet();
+                    cacheEvictions.addAndGet(audioCache.put(cacheKey, samples));
+                } else {
+                    diskCacheMisses.incrementAndGet();
+                    httpRequests.incrementAndGet();
+                    NttsClient.SynthesisResult result = client.generateTts(text, speaker, effect);
+                    if (!result.isSuccess()) {
+                        if (result.getState() == NttsClient.ProviderState.RATE_LIMITED
+                                || result.getState() == NttsClient.ProviderState.QUOTA_EXHAUSTED) {
+                            droppedRequests.incrementAndGet();
+                            rateLimitProviderEvents.incrementAndGet();
+                            recordFailureTimestamp();
+                        } else {
+                            failedRequests.incrementAndGet();
+                            lastFailure = result.getState().displayName();
+                            recordFailureTimestamp();
+                        }
+                        return;
                     }
-                    return;
+                    samples = PcmAudio.fromWav(result.getAudio());
+                    if (samples.length == 0) {
+                        failedRequests.incrementAndGet();
+                        lastFailure = "empty-audio";
+                        recordFailureTimestamp();
+                        return;
+                    }
+                    cacheEvictions.addAndGet(audioCache.put(cacheKey, samples));
+                    diskAudioCache.put(cacheKey, samples);
                 }
-                samples = PcmAudio.fromWav(result.getAudio());
-                if (samples.length == 0) {
-                    failedRequests.incrementAndGet();
-                    lastFailure = "empty-audio";
-                    return;
-                }
-                audioCache.put(cacheKey, samples);
             }
 
             if (!serverReady || voicechatServerApi == null) {
                 failedRequests.incrementAndGet();
                 lastFailure = "server-unavailable";
+                recordFailureTimestamp();
                 return;
             }
-            if ("global".equals(mode)) {
-                playGlobally(globalTargets, samples);
-            } else {
-                playLocally(speakerPlayer, samples);
+            List<PlaybackRequest> requests = pending.complete();
+            inFlightSyntheses.remove(cacheKey, pending);
+            for (PlaybackRequest request : requests) {
+                try {
+                    if ("global".equals(request.mode)) {
+                        playGlobally(request.globalTargets, samples);
+                    } else if (voicechatServerApi.getConnectionOf(request.speakerPlayer) != null) {
+                        playLocally(request.speakerPlayer, samples);
+                    } else {
+                        skippedNoListeners.incrementAndGet();
+                        continue;
+                    }
+                    completedRequests.incrementAndGet();
+                    lastSuccessTimestampSeconds.set(epochSeconds());
+                } catch (RuntimeException exception) {
+                    failedRequests.incrementAndGet();
+                    lastFailure = "playback-unavailable";
+                    recordFailureTimestamp();
+                    logger.debug("Skipped unavailable /N/TTS playback target", exception);
+                }
             }
-            completedRequests.incrementAndGet();
             lastFailure = "none";
         } catch (Exception exception) {
             failedRequests.incrementAndGet();
             lastFailure = "audio-processing";
+            recordFailureTimestamp();
             logger.error("Failed to process /N/TTS audio", exception);
         } finally {
+            inFlightSyntheses.remove(cacheKey, pending);
+            pending.complete();
             totalLatencyMillis.addAndGet(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt));
             timedRequests.incrementAndGet();
+            requestDuration.observe(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt) / 1_000D);
         }
     }
 
@@ -899,6 +1134,7 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
         } catch (RejectedExecutionException exception) {
             long rejected = rejectedRequests.incrementAndGet();
             lastFailure = "queue-full";
+            recordFailureTimestamp();
             if (rejected == 1L || rejected % 100L == 0L) {
                 logger.warn("/N/TTS synthesis queue is full; rejected {} request(s)", rejected);
             }
@@ -1074,6 +1310,9 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
         switch (key) {
             case "enabled":
             case "allow_player_effects":
+            case "memory_cache_enabled":
+            case "disk_cache_enabled":
+            case "metrics_enabled":
                 if (!"true".equalsIgnoreCase(normalizedValue)
                         && !"false".equalsIgnoreCase(normalizedValue)) {
                     throw new IllegalArgumentException(key + " must be 'true' or 'false'");
@@ -1112,6 +1351,30 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
                             "max_text_length must be between 1 and " + MAXIMUM_CONFIGURED_TEXT_LENGTH);
                 }
                 return Integer.toString(configuredMaximum);
+            case "memory_cache_mb":
+            case "disk_cache_mb":
+                return Integer.toString(parseBoundedInteger(
+                        normalizedValue,
+                        key,
+                        1,
+                        MAXIMUM_CACHE_MEGABYTES
+                ));
+            case "cache_ttl_minutes":
+                return Integer.toString(parseBoundedInteger(
+                        normalizedValue,
+                        key,
+                        1,
+                        MAXIMUM_CACHE_TTL_MINUTES
+                ));
+            case "disk_cache_directory":
+                return parseDiskCacheDirectory(normalizedValue).toString();
+            case "metrics_bind_address":
+                Properties metricsProperties = new Properties();
+                metricsProperties.setProperty("metrics_bind_address", normalizedValue);
+                metricsProperties.setProperty("metrics_port", Integer.toString(metricsPort));
+                return MetricsConfiguration.from(metricsProperties).getBindAddress();
+            case "metrics_port":
+                return Integer.toString(MetricsConfiguration.parsePort(normalizedValue));
             default:
                 throw new IllegalArgumentException("unknown configuration key");
         }
@@ -1123,6 +1386,56 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
             throw new IllegalArgumentException(key + " must be 'true' or 'false'");
         }
         return Boolean.parseBoolean(value);
+    }
+
+    private static int parseBoundedIntegerProperty(
+            Properties config,
+            String key,
+            int defaultValue,
+            int minimum,
+            int maximum
+    ) {
+        return parseBoundedInteger(
+                config.getProperty(key, Integer.toString(defaultValue)).trim(),
+                key,
+                minimum,
+                maximum
+        );
+    }
+
+    private static int parseBoundedInteger(String value, String key, int minimum, int maximum) {
+        int parsed = Integer.parseInt(value);
+        if (parsed < minimum || parsed > maximum) {
+            throw new IllegalArgumentException(key + " must be between " + minimum + " and " + maximum);
+        }
+        return parsed;
+    }
+
+    private static Path parseDiskCacheDirectory(String value) {
+        Path configured = Path.of(value == null ? "" : value.trim()).normalize();
+        Path configDirectory = Path.of("config");
+        if (configured.toString().isEmpty() || configured.isAbsolute() || !configured.startsWith(configDirectory)) {
+            throw new IllegalArgumentException("disk_cache_directory must be a relative path under config/");
+        }
+        return configured;
+    }
+
+    private static long megabytesToBytes(int megabytes) {
+        return megabytes * 1024L * 1024L;
+    }
+
+    private static long minutesToMillis(int minutes) {
+        return TimeUnit.MINUTES.toMillis(minutes);
+    }
+
+    private static String synthesisKey(String text, String speaker, String effect) {
+        String source = speaker + '\u0000' + effect + '\u0000' + "wav" + '\u0000' + "48000" + '\u0000' + text;
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(source.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException exception) {
+            throw new IllegalStateException("SHA-256 is required by the JVM", exception);
+        }
     }
 
     private static Properties copyProperties(Properties source) {
@@ -1166,6 +1479,15 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
         properties.setProperty("effect", "");
         properties.setProperty("allow_player_effects", "true");
         properties.setProperty("max_text_length", Integer.toString(DEFAULT_MAXIMUM_TEXT_LENGTH));
+        properties.setProperty("memory_cache_enabled", "true");
+        properties.setProperty("memory_cache_mb", Integer.toString(DEFAULT_MEMORY_CACHE_MEGABYTES));
+        properties.setProperty("cache_ttl_minutes", Integer.toString(DEFAULT_CACHE_TTL_MINUTES));
+        properties.setProperty("disk_cache_enabled", "false");
+        properties.setProperty("disk_cache_directory", "config/ntts-cache");
+        properties.setProperty("disk_cache_mb", Integer.toString(DEFAULT_DISK_CACHE_MEGABYTES));
+        properties.setProperty("metrics_enabled", Boolean.toString(MetricsConfiguration.DEFAULT_ENABLED));
+        properties.setProperty("metrics_bind_address", MetricsConfiguration.DEFAULT_BIND_ADDRESS);
+        properties.setProperty("metrics_port", Integer.toString(MetricsConfiguration.DEFAULT_PORT));
         return properties;
     }
 
@@ -1201,6 +1523,124 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
 
     private void createConfigDirectory() throws IOException {
         Files.createDirectories(CONFIG_FILE.getParent());
+    }
+
+    private String renderPrometheusMetrics() {
+        StringBuilder output = new StringBuilder(4_096);
+        NttsClient currentClient = nttsClient;
+        NttsClient.ProviderState providerState = currentClient.getState();
+
+        appendGauge(output, "ntts_up", metricsServer.isRunning() ? 1L : 0L);
+        appendGauge(output, "ntts_tts_available", providerState == NttsClient.ProviderState.READY ? 1L : 0L);
+        appendGauge(output, "ntts_queue_waiting", synthesisExecutor.getQueue().size());
+        appendGauge(output, "ntts_queue_active", synthesisExecutor.getActiveCount());
+        appendGauge(output, "ntts_queue_capacity", QUEUE_CAPACITY);
+
+        appendMetricType(output, "ntts_requests_total", "counter");
+        appendLabeledSample(output, "ntts_requests_total", "result", "accepted", acceptedRequests.get());
+        appendLabeledSample(output, "ntts_requests_total", "result", "completed", completedRequests.get());
+        appendLabeledSample(output, "ntts_requests_total", "result", "failed", failedRequests.get());
+        appendLabeledSample(output, "ntts_requests_total", "result", "dropped", droppedRequests.get());
+        appendLabeledSample(output, "ntts_requests_total", "result", "rejected", rejectedRequests.get());
+
+        appendMetricType(output, "ntts_http_requests_total", "counter");
+        for (String statusClass : HTTP_STATUS_CLASSES) {
+            appendHttpCounter(output, "success", statusClass, successfulHttpRequests.get(statusClass).get());
+            appendHttpCounter(output, "failure", statusClass, failedHttpRequests.get(statusClass).get());
+        }
+
+        appendMetricType(output, "ntts_request_duration_seconds", "histogram");
+        requestDuration.append(output, "ntts_request_duration_seconds");
+        appendMetricType(output, "ntts_queue_wait_duration_seconds", "histogram");
+        queueWaitDuration.append(output, "ntts_queue_wait_duration_seconds");
+
+        appendMetricType(output, "ntts_cache_requests_total", "counter");
+        appendCacheCounter(output, "memory", "hit", cacheHits.get());
+        appendCacheCounter(output, "memory", "miss", cacheMisses.get());
+        appendCacheCounter(output, "disk", "hit", diskCacheHits.get());
+        appendCacheCounter(output, "disk", "miss", diskCacheMisses.get());
+        appendMetricType(output, "ntts_cache_evictions_total", "counter");
+        appendLabeledSample(output, "ntts_cache_evictions_total", "cache", "memory", cacheEvictions.get());
+        appendMetricType(output, "ntts_inflight_deduplicated_total", "counter");
+        appendCounterValue(output, "ntts_inflight_deduplicated_total", deduplicatedRequests.get());
+        appendMetricType(output, "ntts_skipped_no_listeners_total", "counter");
+        appendCounterValue(output, "ntts_skipped_no_listeners_total", skippedNoListeners.get());
+        appendMetricType(output, "ntts_rate_limit_events_total", "counter");
+        appendLabeledSample(output, "ntts_rate_limit_events_total", "source", "http", rateLimitHttpEvents.get());
+        appendLabeledSample(output, "ntts_rate_limit_events_total", "source", "provider", rateLimitProviderEvents.get());
+
+        appendGauge(output, "ntts_quota_exhausted", providerState == NttsClient.ProviderState.QUOTA_EXHAUSTED
+                || currentClient.isQuotaExhausted() ? 1L : 0L);
+        appendGauge(output, "ntts_quota_characters_used", currentClient.getQuotaCharactersUsed());
+        appendGauge(output, "ntts_quota_characters_limit", currentClient.getQuotaCharactersLimit());
+        appendGauge(output, "ntts_last_success_timestamp_seconds", lastSuccessTimestampSeconds.get());
+        appendGauge(output, "ntts_last_failure_timestamp_seconds", lastFailureTimestampSeconds.get());
+        appendGauge(output, "ntts_uptime_seconds", TimeUnit.NANOSECONDS.toSeconds(
+                System.nanoTime() - metricsStartedAtNanos
+        ));
+        return output.toString();
+    }
+
+    private void recordHttpRequest(String statusClass, boolean success, boolean rateLimited) {
+        String boundedStatusClass = HTTP_STATUS_CLASSES.contains(statusClass) ? statusClass : "network";
+        Map<String, AtomicLong> counters = success ? successfulHttpRequests : failedHttpRequests;
+        counters.get(boundedStatusClass).incrementAndGet();
+        if (rateLimited) {
+            rateLimitHttpEvents.incrementAndGet();
+            recordFailureTimestamp();
+        }
+    }
+
+    private static Map<String, AtomicLong> createHttpCounters() {
+        Map<String, AtomicLong> counters = new LinkedHashMap<>();
+        for (String statusClass : HTTP_STATUS_CLASSES) {
+            counters.put(statusClass, new AtomicLong());
+        }
+        return Collections.unmodifiableMap(counters);
+    }
+
+    private static void appendGauge(StringBuilder output, String name, long value) {
+        output.append("# TYPE ").append(name).append(" gauge\n")
+                .append(name).append(' ').append(value).append('\n');
+    }
+
+    private static void appendMetricType(StringBuilder output, String name, String type) {
+        output.append("# TYPE ").append(name).append(' ').append(type).append('\n');
+    }
+
+    private static void appendLabeledSample(
+            StringBuilder output,
+            String name,
+            String labelName,
+            String labelValue,
+            long value
+    ) {
+        output.append(name).append('{').append(labelName).append("=\"")
+                .append(labelValue).append("\"} ").append(value).append('\n');
+    }
+
+    private static void appendCounterValue(StringBuilder output, String name, long value) {
+        output.append(name).append(' ').append(value).append('\n');
+    }
+
+    private static void appendHttpCounter(StringBuilder output, String result, String statusClass, long value) {
+        output.append("ntts_http_requests_total{result=\"").append(result)
+                .append("\",status_class=\"").append(statusClass).append("\"} ")
+                .append(value).append('\n');
+    }
+
+    private static void appendCacheCounter(StringBuilder output, String cache, String result, long value) {
+        output.append("ntts_cache_requests_total{cache=\"").append(cache)
+                .append("\",result=\"").append(result).append("\"} ")
+                .append(value).append('\n');
+    }
+
+    private static long epochSeconds() {
+        return System.currentTimeMillis() / 1_000L;
+    }
+
+    private void recordFailureTimestamp() {
+        lastFailureTimestampSeconds.set(epochSeconds());
     }
 
     private static final class PlayerAdministrationData {
@@ -1248,40 +1688,42 @@ public abstract class NttsPluginCore implements VoicechatPlugin {
         }
     }
 
-    private static final class AudioCache {
-        private final long maximumBytes;
-        private final LinkedHashMap<String, short[]> entries = new LinkedHashMap<>(16, 0.75F, true);
-        private long usedBytes;
+    private static final class PlaybackRequest {
+        private final ServerPlayer speakerPlayer;
+        private final List<ServerPlayer> globalTargets;
+        private final String mode;
 
-        private AudioCache(long maximumBytes) {
-            this.maximumBytes = maximumBytes;
+        private PlaybackRequest(ServerPlayer speakerPlayer, List<ServerPlayer> globalTargets, String mode) {
+            this.speakerPlayer = speakerPlayer;
+            this.globalTargets = List.copyOf(globalTargets);
+            this.mode = mode;
+        }
+    }
+
+    private static final class PendingSynthesis {
+        private final List<PlaybackRequest> requests = new ArrayList<>();
+        private boolean completed;
+
+        private PendingSynthesis(PlaybackRequest initialRequest) {
+            requests.add(initialRequest);
         }
 
-        private synchronized short[] get(String key) {
-            return entries.get(key);
+        private synchronized boolean add(PlaybackRequest request) {
+            if (completed) {
+                return false;
+            }
+            requests.add(request);
+            return true;
         }
 
-        private synchronized void put(String key, short[] samples) {
-            long sampleBytes = samples.length * 2L;
-            if (sampleBytes > maximumBytes) {
-                return;
+        private synchronized List<PlaybackRequest> complete() {
+            if (completed) {
+                return Collections.emptyList();
             }
-            short[] previous = entries.put(key, samples);
-            if (previous != null) {
-                usedBytes -= previous.length * 2L;
-            }
-            usedBytes += sampleBytes;
-            Iterator<Map.Entry<String, short[]>> iterator = entries.entrySet().iterator();
-            while (usedBytes > maximumBytes && iterator.hasNext()) {
-                Map.Entry<String, short[]> eldest = iterator.next();
-                usedBytes -= eldest.getValue().length * 2L;
-                iterator.remove();
-            }
-        }
-
-        private synchronized void clear() {
-            entries.clear();
-            usedBytes = 0L;
+            completed = true;
+            List<PlaybackRequest> completedRequests = new ArrayList<>(requests);
+            requests.clear();
+            return completedRequests;
         }
     }
 }
