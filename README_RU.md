@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/phystenia-ntts-banner.png" alt="Phystenia NTTS" width="900">
+  <img src="assets/phystenia-ntts-banner.png?v=eefd9cc" alt="Phystenia NTTS" width="900">
 </p>
 
 <p align="center">
