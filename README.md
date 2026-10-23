@@ -1,44 +1,43 @@
-# NTTS для Minecraft
+<p align="center">
+  <img src="assets/phystenia-ntts-banner.png" alt="Phystenia NTTS" width="900">
+</p>
 
-[English version](README.EN.md)
+<p align="center">
+  <sub><code>LANGUAGE:</code></sub><br>
+  <a href="README.md"><img src="https://github.com/cryals/ACatalog/blob/main/data/flag/english.webp?raw=true" alt="English README" width="24" height="16"></a>
+  <a href="README_RU.md"><img src="https://github.com/cryals/ACatalog/blob/main/data/flag/russia.webp?raw=true" alt="Russian README" width="24" height="16"></a>
+</p>
 
-NTTS озвучивает сообщения игрового чата через [/N/TTS](https://ntts.fdev.team/) и воспроизводит их с помощью [Simple Voice Chat](https://modrinth.com/plugin/simple-voice-chat).
+<p align="center">
+  <b>Text-to-speech for Minecraft chat with Simple Voice Chat.</b><br>
+  A Phystenia fork of <a href="https://github.com/Nonne46/ntts-voicechat">Nonne46/ntts-voicechat</a>, maintained with project-specific changes.
+</p>
 
-Проект поддерживает Fabric, Forge и NeoForge. NTTS устанавливается на сервер, а Simple Voice Chat должен быть установлен на сервере и у игроков.
+NTTS converts Minecraft chat messages to speech via [/N/TTS](https://ntts.fdev.team/) and plays them through [Simple Voice Chat](https://modrinth.com/plugin/simple-voice-chat). Install NTTS on the server; install Simple Voice Chat on both the server and players' clients.
 
-## Возможности
+## Features
 
-- Глобальное или локальное воспроизведение речи.
-- Стандартное или случайное начальное назначение голоса.
-- Персональные голоса и эффекты для игроков.
-- Серверный голос и эффект по умолчанию.
-- Команды для управления модом и настройками игроков.
+- Proximity or global speech playback.
+- Default, random, and player-selected voices and effects.
+- Operator commands for runtime, queue, and player settings.
+- Memory and optional disk caching.
+- Optional local Prometheus metrics endpoint for Grafana dashboards.
 
-## Поддерживаемые версии
+## Compatibility
 
-- 1.19.2
-- 1.20.1
-- 1.21.1
-- 1.21.4
-- 1.21.5
-- 1.21.8
-- 1.21.11
-- 26.1.2
-- 26.2
+Fabric and Forge builds are available for Minecraft 1.19.2, 1.20.1, 1.21.1, 1.21.4, 1.21.5, 1.21.8, 1.21.11, 26.1.2, and 26.2. NeoForge 21.1.248 is supported only for Minecraft 1.21.1.
 
-Для каждой версии доступны отдельные сборки Fabric и Forge. Для Minecraft 1.21.1 также доступна сборка NeoForge 21.1.248 на странице [Releases](https://github.com/Nonne46/ntts-voicechat/releases).
+## Installation
 
-## Установка
+1. Install the matching Fabric, Forge, or NeoForge loader.
+2. Install Simple Voice Chat on the server and clients.
+3. Put the matching NTTS JAR in the server's `mods/` directory.
+4. Start the server once to create `config/ntts.properties`.
+5. Configure the token, then restart the server or run `/ntts reload`.
 
-1. Установите подходящий загрузчик Fabric, Forge или NeoForge.
-2. Установите Simple Voice Chat на сервер и клиент.
-3. Поместите соответствующий JAR-файл NTTS в серверный каталог `mods/`.
-4. Запустите сервер, чтобы создать `config/ntts.properties`.
-5. Укажите токен и перезапустите сервер либо выполните `/ntts reload`.
+Get a token from [/N/TTS on Boosty](https://boosty.to/ntts). Prefer the `NTTS_TOKEN` environment variable instead of storing a token in the configuration file.
 
-Токен можно получить на [странице /N/TTS в Boosty](https://boosty.to/ntts). Рекомендуется передавать его через переменную окружения `NTTS_TOKEN`, а не хранить в файле конфигурации.
-
-## Настройка
+## Configuration
 
 ```properties
 enabled=true
@@ -60,35 +59,20 @@ metrics_bind_address=127.0.0.1
 metrics_port=9464
 ```
 
-- `mode=local` — речь слышна рядом с отправителем.
-- `mode=global` — речь слышат все игроки.
-- `voice_mode=static` — игроки без настройки получают голос по умолчанию.
-- `voice_mode=random` — игроки без настройки получают случайный голос до перезагрузки NTTS.
-- `memory_cache_mb` и `cache_ttl_minutes` ограничивают LRU-кеш готового PCM-аудио в памяти.
-- `disk_cache_enabled=true` включает постоянный кеш в `config/ntts-cache`; по умолчанию он выключен.
-- TTS не вызывается, если нет подключённых слушателей Simple Voice Chat; совпадающие одновременные фразы объединяются в один запрос.
-- `metrics_enabled=true` включает `GET /metrics` для Prometheus. По умолчанию endpoint выключен и после включения слушает только `127.0.0.1`.
-- `metrics_port=0` выбирает свободный ephemeral-порт; фактический порт появляется в логе и `/ntts status`. Внешний bind задавайте только осознанно через `metrics_bind_address`.
+- `mode=local` plays speech near the sender; `mode=global` plays it to everyone.
+- `voice_mode=static` uses the default voice; `voice_mode=random` assigns a temporary random voice.
+- `disk_cache_enabled=true` enables the cache in `config/ntts-cache`.
+- Prometheus is disabled by default. With `metrics_enabled=true`, `GET /metrics` listens on loopback only. Set `metrics_port=0` to select a free port; use an external bind address only intentionally.
 
-Голос, выбранный командой `/set_speaker`, всегда имеет приоритет над начальным назначением.
-
-## Команды
-
-Игроки могут использовать:
+## Commands
 
 ```text
 /set_speaker <speaker>
 /set_effect <effect|none>
-```
 
-Основные команды оператора:
-
-```text
 /ntts help
 /ntts status
-/ntts enable
-/ntts disable
-/ntts reload
+/ntts enable|disable|reload
 /ntts get <key>
 /ntts set <key> <value>
 /ntts reset <key|all>
@@ -98,11 +82,9 @@ metrics_port=9464
 /ntts queue clear
 ```
 
-Полный список и синтаксис доступны через `/ntts help`.
+Run `/ntts help` for full syntax.
 
-## Prometheus/Grafana
-
-Добавьте в `prometheus.yml` на машине Minecraft:
+## Prometheus / Grafana
 
 ```yaml
 scrape_configs:
@@ -111,31 +93,21 @@ scrape_configs:
       - targets: ["127.0.0.1:9464"]
 ```
 
-Для базовых Grafana-панелей используйте PromQL:
+Useful PromQL metrics include `ntts_request_duration_seconds_bucket`, `ntts_queue_wait_duration_seconds_bucket`, `rate(ntts_requests_total{result="completed"}[5m])`, `ntts_rate_limit_events_total`, and `ntts_tts_available`.
 
-```text
-ntts_request_duration_seconds_bucket
-ntts_queue_wait_duration_seconds_bucket
-rate(ntts_requests_total{result="completed"}[5m])
-rate(ntts_requests_total{result=~"failed|dropped|rejected"}[5m])
-ntts_rate_limit_events_total
-ntts_quota_exhausted
-ntts_tts_available
-```
+## Building
 
-## Сборка
-
-Для полной сборки установите JDK 21 и JDK 25 или 26:
+Install JDK 21 and JDK 25 or 26 for the complete build matrix:
 
 ```bash
-scripts/build.sh                 # все загрузчики и версии
-scripts/build.sh fabric          # все версии Fabric
-scripts/build.sh forge 1.20.1    # Forge для Minecraft 1.20.1
+scripts/build.sh                 # all loaders and versions
+scripts/build.sh fabric          # all Fabric versions
+scripts/build.sh forge 1.20.1    # Forge for Minecraft 1.20.1
 scripts/build.sh neoforge 1.21.1 # NeoForge 21.1.248
 ```
 
-Готовые файлы появятся в каталоге `dist/`.
+Built JARs are written to `dist/`.
 
-## Лицензия
+## License
 
-[MIT](LICENSE) © 2026 Nonne
+The repository history before commit [`c17169ad393d403b9603b95871d5afe9c4d29d7f`](https://github.com/Phystenia/ntts-minecraft/commit/c17169ad393d403b9603b95871d5afe9c4d29d7f) is licensed under [MIT](LICENSE-MIT.TXT). Starting with that commit, this Phystenia fork is proprietary and distributed under the [Phystenia Project License](LICENSE.TXT). Some files may carry separate third-party licenses.
